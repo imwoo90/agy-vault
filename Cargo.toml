@@ -1,0 +1,29 @@
+[package]
+name = "agy-vault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["imwoo90 <wim90@kakao.com>"]
+license = "Apache-2.0"
+description = "Zero-Knowledge Antigravity Session Preservation & Auto-Restore Daemon using ext4 inode hardlinks and inotify."
+readme = "README.md"
+repository = "https://github.com/imwoo90/agy-vault"
+keywords = ["antigravity", "session-vault", "hardlink", "inotify", "agent-native"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+
+[dev-dependencies]
+syn = { version = "2.0", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+[build-dependencies]
+syn = { version = "2.0", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

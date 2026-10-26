@@ -1,0 +1,29 @@
+# ==============================================================================
+# Agent-Native Architectural Limits (.agent-lint.toml)
+#
+# Configures the compile-time guardrails enforced by `build.rs` / `build_linter.rs`.
+# Adjust these thresholds to match your project's architectural standards.
+# ==============================================================================
+
+[limits]
+# Rule 1: Minimum characters required in module-level `//!` living-wiki header.
+min_module_doc_chars = 100
+
+# Rule 1b: Enforce structured Living Wiki schema (## Overview, ## Search Tags, ## Submodules).
+enforce_doc_schema = true
+
+# Rule 2: Maximum active production code characters per file (excluding tests & comments).
+max_logical_code_chars = 10000
+
+# Rule 2b: Maximum inline test characters in `src/` files before requiring extraction to `tests/`.
+max_inline_test_chars = 5000
+
+# Rule 3: Maximum documentation characters per file (keeps context SNR high for LLMs).
+max_doc_chars = 4000
+
+# Rule 4: Maximum physical characters per individual logic function (production or test).
+max_function_chars = 2000
+
+# Rule 4b: Maximum physical characters for declarative UI components (#[component] / rsx! / html! / view!),
+# accommodating utility CSS strings (e.g. Tailwind) without forcing artificial micro-splitting.
+max_ui_component_chars = 3500

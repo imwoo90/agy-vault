@@ -1,0 +1,281 @@
+//! # Real-Time Linux `inotify` Watcher Daemon
+//!
+//! ## Overview
+//! Watches `~/.gemini/antigravity-cli/{conversations,brain,annotations}` using the Linux kernel
+//! `inotify` subsystem. Performs immediate forward hardlinking when new `.db`, `.db-wal`, `.db-shm`,
+//! or `brain/<uuid>` files appear, and triggers `< 1ms` reverse restoration when the Antigravity
+//! IDE or CLI accesses `annotations/<uuid>.pbtxt` for a garbage-collected conversation.
+//!
+//! ## Search Tags
+//! #inotify, #daemon, #auto-restore, #linux-syscalls, #real-time
+
+use crate::restore::restore_session;
+use crate::vault_engine::{VaultConfig, is_uuid_like, sync_all, sync_session};
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+const IN_ACCESS: u32 = 0x0000_0001;
+const IN_MODIFY: u32 = 0x0000_0002;
+const IN_ATTRIB: u32 = 0x0000_0004;
+const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+const IN_OPEN: u32 = 0x0000_0020;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
+
+const IN_CLOEXEC: i32 = 0o2000000;
+const IN_NONBLOCK: i32 = 0o0004000;
+const POLLIN: i16 = 0x0001;
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+struct InotifyEventHeader {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    len: u32,
+}
+
+unsafe extern "C" {
+    fn inotify_init1(flags: i32) -> i32;
+    fn inotify_add_watch(fd: i32, pathname: *const i8, mask: u32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn close(fd: i32) -> i32;
+}
+
+/// Configuration for the real-time `inotify` watcher daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonConfig {
+    /// Underlying active and vault directory configuration.
+    pub vault: VaultConfig,
+    /// Poll interval in milliseconds for `inotify` + background reconciliation.
+    pub poll_ms: i32,
+    /// Optional maximum number of poll ticks to execute before exiting (`None` = run forever).
+    pub max_ticks: Option<usize>,
+}
+
+/// Runtime telemetry counters collected by [`run_daemon`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonStats {
+    /// Number of poll loop iterations completed.
+    pub ticks_completed: usize,
+    /// Number of raw `inotify` kernel events processed.
+    pub inotify_events_processed: usize,
+    /// Number of real-time forward session syncs triggered by `inotify`.
+    pub forward_syncs_triggered: usize,
+    /// Number of `< 1ms` reverse session restorations triggered by `annotations/*.pbtxt` access.
+    pub auto_restores_triggered: usize,
+}
+
+/// RAII wrapper around a Linux `inotify` file descriptor and its directory watch descriptors.
+struct InotifyGuard {
+    fd: i32,
+    conversations_wd: i32,
+    brain_wd: i32,
+    annotations_wd: i32,
+}
+
+impl InotifyGuard {
+    fn new(config: &VaultConfig) -> Result<Self, String> {
+        fs::create_dir_all(config.active_conversations_dir()).map_err(|e| e.to_string())?;
+        fs::create_dir_all(config.active_brain_dir()).map_err(|e| e.to_string())?;
+        fs::create_dir_all(config.active_annotations_dir()).map_err(|e| e.to_string())?;
+
+        // SAFETY: `inotify_init1` is a standard thread-safe Linux syscall taking bitflags.
+        let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
+        if fd < 0 {
+            return Err("inotify_init1 syscall failed".to_string());
+        }
+
+        let conv_mask =
+            IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_ATTRIB;
+        let brain_mask = IN_CREATE | IN_MOVED_TO | IN_MODIFY;
+        let ann_mask = IN_ACCESS | IN_OPEN | IN_MODIFY | IN_CREATE | IN_MOVED_TO;
+
+        let conversations_wd = Self::add_watch(fd, &config.active_conversations_dir(), conv_mask)?;
+        let brain_wd = Self::add_watch(fd, &config.active_brain_dir(), brain_mask)?;
+        let annotations_wd = Self::add_watch(fd, &config.active_annotations_dir(), ann_mask)?;
+
+        Ok(Self {
+            fd,
+            conversations_wd,
+            brain_wd,
+            annotations_wd,
+        })
+    }
+
+    fn add_watch(fd: i32, path: &Path, mask: u32) -> Result<i32, String> {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("invalid NUL byte in watch path {}", path.display()))?;
+        // SAFETY: `c_path` is a valid NUL-terminated C string and `fd` is a valid inotify descriptor.
+        let wd = unsafe { inotify_add_watch(fd, c_path.as_ptr(), mask) };
+        if wd < 0 {
+            return Err(format!("inotify_add_watch failed for {}", path.display()));
+        }
+        Ok(wd)
+    }
+}
+
+impl Drop for InotifyGuard {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            // SAFETY: `self.fd` is owned exclusively by `InotifyGuard`.
+            unsafe {
+                let _ = close(self.fd);
+            }
+        }
+    }
+}
+
+/// Extracts a canonical UUID from a conversation database filename (`<uuid>.db`, `.db-wal`, `.db-shm`).
+fn extract_conversation_uuid(file_name: &str) -> Option<&str> {
+    let stem = file_name
+        .strip_suffix(".db")
+        .or_else(|| file_name.strip_suffix(".db-wal"))
+        .or_else(|| file_name.strip_suffix(".db-shm"))?;
+    if is_uuid_like(stem) {
+        Some(stem)
+    } else {
+        None
+    }
+}
+
+/// Processes a single `inotify` event from `conversations/`, `brain/`, or `annotations/`.
+fn handle_inotify_event(
+    config: &VaultConfig,
+    guard: &InotifyGuard,
+    wd: i32,
+    mask: u32,
+    name: &str,
+    stats: &mut DaemonStats,
+) {
+    if name.is_empty() || name.starts_with('.') {
+        return;
+    }
+
+    if wd == guard.annotations_wd {
+        if let Some(uuid) = name.strip_suffix(".pbtxt")
+            && is_uuid_like(uuid)
+        {
+            if (mask & (IN_ACCESS | IN_OPEN | IN_MODIFY)) != 0 {
+                let active_db = config.active_conversations_dir().join(format!("{uuid}.db"));
+                let vault_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
+                let vault_brain = config.vault_brain_dir().join(uuid);
+                if !active_db.is_file()
+                    && (vault_db.is_file() || vault_brain.is_dir())
+                    && let Ok(rep) = restore_session(config, uuid)
+                {
+                    stats.auto_restores_triggered += 1;
+                    println!(
+                        "[agy-vault] auto-restored session {} in {} us (db={}, brain_files={})",
+                        rep.uuid,
+                        rep.elapsed_micros,
+                        rep.db_restored,
+                        rep.brain_files_restored
+                    );
+                }
+            }
+            if (mask & (IN_CREATE | IN_MOVED_TO | IN_MODIFY)) != 0 {
+                let _ = sync_session(config, uuid);
+            }
+        }
+    } else if wd == guard.conversations_wd {
+        if let Some(uuid) = extract_conversation_uuid(name)
+            && sync_session(config, uuid).is_ok()
+        {
+            stats.forward_syncs_triggered += 1;
+        }
+    } else if wd == guard.brain_wd && is_uuid_like(name) && sync_session(config, name).is_ok() {
+        stats.forward_syncs_triggered += 1;
+    }
+}
+
+/// Drains all pending events from the non-blocking `inotify` descriptor.
+fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut DaemonStats) {
+    let mut buf = [0u8; 16384];
+    let header_size = std::mem::size_of::<InotifyEventHeader>();
+
+    loop {
+        // SAFETY: `buf` is a stack array of 16384 bytes and `guard.fd` is non-blocking.
+        let n = unsafe { read(guard.fd, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        let bytes_read = n as usize;
+        let mut offset = 0usize;
+
+        while offset + header_size <= bytes_read {
+            // SAFETY: We copy the unaligned header bytes into a stack-aligned struct.
+            let header: InotifyEventHeader = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const InotifyEventHeader)
+            };
+            offset += header_size;
+            let name_len = header.len as usize;
+            if offset + name_len > bytes_read {
+                break;
+            }
+            let name_slice = &buf[offset..offset + name_len];
+            let nul_pos = name_slice
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_len);
+            if let Ok(name_str) = std::str::from_utf8(&name_slice[..nul_pos]) {
+                stats.inotify_events_processed += 1;
+                handle_inotify_event(config, guard, header.wd, header.mask, name_str, stats);
+            }
+            offset += name_len;
+        }
+    }
+}
+
+/// Runs the real-time `inotify` watcher daemon and periodic deep-brain reconciliation loop.
+pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
+    let initial = sync_all(&daemon_cfg.vault)?;
+    println!(
+        "[agy-vault] initial sync complete: active_db={}, brain_dirs={}, annotations={}, new_links={}, elapsed={}ms",
+        initial.active_db_synced,
+        initial.brain_dirs_synced,
+        initial.annotations_synced,
+        initial.hardlinks_created,
+        initial.elapsed_ms
+    );
+
+    let guard = InotifyGuard::new(&daemon_cfg.vault)?;
+    let mut stats = DaemonStats::default();
+
+    loop {
+        let mut pfd = PollFd {
+            fd: guard.fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid single-element `PollFd` struct on the stack.
+        let ready = unsafe { poll(&mut pfd as *mut PollFd, 1, daemon_cfg.poll_ms) };
+        if ready > 0 && (pfd.revents & POLLIN) != 0 {
+            drain_inotify_events(&daemon_cfg.vault, &guard, &mut stats);
+        }
+
+        stats.ticks_completed += 1;
+        if stats.ticks_completed.is_multiple_of(5) {
+            let _ = sync_all(&daemon_cfg.vault);
+        }
+
+        if let Some(max) = daemon_cfg.max_ticks
+            && stats.ticks_completed >= max
+        {
+            drain_inotify_events(&daemon_cfg.vault, &guard, &mut stats);
+            break;
+        }
+    }
+
+    Ok(stats)
+}
