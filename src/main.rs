@@ -11,16 +11,16 @@
 //! #cli, #entrypoint, #antigravity, #vault, #subcommands
 
 use agy_vault::{
-    CliOptions, DaemonConfig, SyncReport, VaultStatus, build_vault_config, compute_status,
-    install_shim_script, parse_cli_args, restore_session, run_daemon, run_shim_exec, sync_all,
+    CliOptions, DaemonConfig, PatchOutcome, SyncReport, VaultStatus, build_vault_config,
+    compute_status, ensure_agy_binary_unbounded, parse_cli_args, restore_all_from_vault,
+    restore_session, run_daemon, sync_all,
 };
 use std::env;
-use std::path::PathBuf;
 use std::process;
 
 /// Prints CLI usage instructions.
 fn print_help() {
-    println!("agy-vault: Zero-Knowledge Antigravity Session Preservation & Auto-Restore Daemon");
+    println!("agy-vault: Zero-Knowledge Antigravity Session Preservation & Auto-Patching Daemon");
     println!();
     println!("USAGE:");
     println!("  agy-vault <SUBCOMMAND> [OPTIONS]");
@@ -29,9 +29,8 @@ fn print_help() {
     println!("  sync                  Mirror active conversations, brain dirs, and annotations via ext4 hardlinks");
     println!("  status [--json]       Display active vs vaulted session counts and zero-overhead inode metrics");
     println!("  restore <uuid>        Restore a garbage-collected session from the vault in <1ms");
-    println!("  daemon                Run real-time inotify forward-sync and auto-restore watcher");
-    println!("  shim-exec -- <args>   Pre-restore referenced UUIDs and execute the real agy binary");
-    println!("  install-shim          Install transparent CLI wrapper at ~/.local/bin/agy-vault-shim");
+    println!("  daemon                Run real-time inotify forward-sync and auto-patcher watcher");
+    println!("  patch-binary          Scan and patch bin/agy MaxConversations (500 -> 0) and restore all sessions");
 }
 
 /// Formats and prints the output of `agy-vault sync`.
@@ -100,24 +99,29 @@ fn render_status_output(st: &VaultStatus, json_output: bool) {
     println!("  Logical vault size          : {:.2} MB (extra disk: {:.2} MB)", st.logical_vault_bytes as f64 / mb, st.vault_only_bytes as f64 / mb);
 }
 
-/// Executes the `install-shim` subcommand.
-fn run_install_shim(opts: &CliOptions, cfg: &agy_vault::VaultConfig) -> Result<i32, String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let shim_path = opts
-        .shim_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(&home).join(".local/bin/agy"));
+/// Executes the `patch-binary` subcommand.
+fn run_patch_binary(opts: &CliOptions, cfg: &agy_vault::VaultConfig) -> Result<i32, String> {
     let real_agy = opts
         .real_agy
         .clone()
         .unwrap_or_else(|| cfg.agy_dir.join("bin").join("agy"));
-    let current_exe = env::current_exe().map_err(|e| e.to_string())?;
-    let installed = install_shim_script(&shim_path, &current_exe, &real_agy)?;
-    println!(
-        "Installed agy-vault CLI shim at {} -> {}",
-        installed.display(),
-        real_agy.display()
-    );
+    let outcome = ensure_agy_binary_unbounded(&real_agy)?;
+    let restored = restore_all_from_vault(cfg)?;
+    let _ = sync_all(cfg)?;
+    match outcome {
+        PatchOutcome::NewlyPatched(off) => println!(
+            "Patched {} at offset 0x{off:x} (MaxConversations: 500 -> 0), restored {restored} sessions",
+            real_agy.display()
+        ),
+        PatchOutcome::AlreadyPatched(off) => println!(
+            "Verified {} already patched at offset 0x{off:x} (MaxConversations = 0), restored {restored} sessions",
+            real_agy.display()
+        ),
+        PatchOutcome::SignatureNotFound => println!(
+            "Signature not found in {}, restored {restored} sessions",
+            real_agy.display()
+        ),
+    }
     Ok(0)
 }
 
@@ -130,11 +134,12 @@ fn run_daemon_cmd(opts: &CliOptions, cfg: agy_vault::VaultConfig) -> Result<i32,
     };
     let stats = run_daemon(&dcfg)?;
     println!(
-        "[agy-vault] daemon exited: ticks={}, events={}, syncs={}, auto_restores={}",
+        "[agy-vault] daemon exited: ticks={}, events={}, syncs={}, auto_restores={}, patches={}",
         stats.ticks_completed,
         stats.inotify_events_processed,
         stats.forward_syncs_triggered,
-        stats.auto_restores_triggered
+        stats.auto_restores_triggered,
+        stats.binary_patches_applied
     );
     Ok(0)
 }
@@ -149,6 +154,7 @@ fn execute_cli(opts: CliOptions) -> Result<i32, String> {
 
     match opts.subcommand.as_str() {
         "sync" => {
+            let _ = restore_all_from_vault(&cfg)?;
             let rep = sync_all(&cfg)?;
             let status = compute_status(&cfg)?;
             render_sync_output(&rep, &status, opts.json_output);
@@ -177,13 +183,7 @@ fn execute_cli(opts: CliOptions) -> Result<i32, String> {
             Ok(0)
         }
         "daemon" => run_daemon_cmd(&opts, cfg),
-        "shim-exec" => {
-            let real_agy = opts
-                .real_agy
-                .unwrap_or_else(|| cfg.agy_dir.join("bin").join("agy"));
-            run_shim_exec(&cfg, &real_agy, &opts.passthrough_args)
-        }
-        "install-shim" => run_install_shim(&opts, &cfg),
+        "patch-binary" => run_patch_binary(&opts, &cfg),
         other => Err(format!("unknown subcommand '{other}' (run with --help)")),
     }
 }

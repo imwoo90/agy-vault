@@ -10,6 +10,7 @@
 //! #inotify, #daemon, #auto-restore, #linux-syscalls, #real-time
 
 use crate::restore::restore_session;
+use crate::shim::{PatchOutcome, ensure_agy_binary_unbounded, restore_all_from_vault};
 use crate::vault_engine::{VaultConfig, is_uuid_like, sync_all, sync_session};
 use std::ffi::CString;
 use std::fs;
@@ -23,6 +24,7 @@ const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 const IN_OPEN: u32 = 0x0000_0020;
 const IN_MOVED_TO: u32 = 0x0000_0080;
 const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
 
 const IN_CLOEXEC: i32 = 0o2000000;
 const IN_NONBLOCK: i32 = 0o0004000;
@@ -71,8 +73,10 @@ pub struct DaemonStats {
     pub inotify_events_processed: usize,
     /// Number of real-time forward session syncs triggered by `inotify`.
     pub forward_syncs_triggered: usize,
-    /// Number of `< 1ms` reverse session restorations triggered by `annotations/*.pbtxt` access.
+    /// Number of `< 1ms` reverse session restorations triggered by `inotify`.
     pub auto_restores_triggered: usize,
+    /// Number of times `bin/agy` was patched to disable the 500-conversation GC limit.
+    pub binary_patches_applied: usize,
 }
 
 /// RAII wrapper around a Linux `inotify` file descriptor and its directory watch descriptors.
@@ -81,13 +85,16 @@ struct InotifyGuard {
     conversations_wd: i32,
     brain_wd: i32,
     annotations_wd: i32,
+    bin_wd: i32,
 }
 
 impl InotifyGuard {
     fn new(config: &VaultConfig) -> Result<Self, String> {
+        let bin_dir = config.agy_dir.join("bin");
         fs::create_dir_all(config.active_conversations_dir()).map_err(|e| e.to_string())?;
         fs::create_dir_all(config.active_brain_dir()).map_err(|e| e.to_string())?;
         fs::create_dir_all(config.active_annotations_dir()).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
 
         // SAFETY: `inotify_init1` is a standard thread-safe Linux syscall taking bitflags.
         let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
@@ -95,19 +102,22 @@ impl InotifyGuard {
             return Err("inotify_init1 syscall failed".to_string());
         }
 
-        let conv_mask = IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB;
-        let brain_mask = IN_CREATE | IN_MOVED_TO | IN_MODIFY;
+        let conv_mask = IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB | IN_DELETE;
+        let brain_mask = IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_DELETE;
         let ann_mask = IN_ACCESS | IN_OPEN | IN_MODIFY | IN_CREATE | IN_MOVED_TO;
+        let bin_mask = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE;
 
         let conversations_wd = Self::add_watch(fd, &config.active_conversations_dir(), conv_mask)?;
         let brain_wd = Self::add_watch(fd, &config.active_brain_dir(), brain_mask)?;
         let annotations_wd = Self::add_watch(fd, &config.active_annotations_dir(), ann_mask)?;
+        let bin_wd = Self::add_watch(fd, &bin_dir, bin_mask)?;
 
         Ok(Self {
             fd,
             conversations_wd,
             brain_wd,
             annotations_wd,
+            bin_wd,
         })
     }
 
@@ -172,7 +182,7 @@ fn handle_annotation_event(config: &VaultConfig, mask: u32, name: &str, stats: &
     }
 }
 
-/// Processes a single `inotify` event from `conversations/`, `brain/`, or `annotations/`.
+/// Processes a single `inotify` event from `conversations/`, `brain/`, `annotations/`, or `bin/`.
 fn handle_inotify_event(
     config: &VaultConfig,
     guard: &InotifyGuard,
@@ -183,16 +193,35 @@ fn handle_inotify_event(
     if name.is_empty() || name.starts_with('.') {
         return;
     }
-    if hdr.wd == guard.annotations_wd {
+    if hdr.wd == guard.bin_wd && name == "agy" {
+        let bin_path = config.agy_dir.join("bin/agy");
+        if let Ok(PatchOutcome::NewlyPatched(off)) = ensure_agy_binary_unbounded(&bin_path) {
+            stats.binary_patches_applied += 1;
+            let _ = restore_all_from_vault(config);
+            println!(
+                "[agy-vault] auto-patched updated agy binary at offset 0x{off:x} (MaxConversations: 500 -> 0)"
+            );
+        }
+    } else if hdr.wd == guard.annotations_wd {
         handle_annotation_event(config, hdr.mask, name, stats);
     } else if hdr.wd == guard.conversations_wd {
-        if let Some(uuid) = extract_conversation_uuid(name)
-            && sync_session(config, uuid).is_ok()
-        {
+        if let Some(uuid) = extract_conversation_uuid(name) {
+            if (hdr.mask & IN_DELETE) != 0 {
+                if restore_session(config, uuid).is_ok() {
+                    stats.auto_restores_triggered += 1;
+                }
+            } else if sync_session(config, uuid).is_ok() {
+                stats.forward_syncs_triggered += 1;
+            }
+        }
+    } else if hdr.wd == guard.brain_wd && is_uuid_like(name) {
+        if (hdr.mask & IN_DELETE) != 0 {
+            if restore_session(config, name).is_ok() {
+                stats.auto_restores_triggered += 1;
+            }
+        } else if sync_session(config, name).is_ok() {
             stats.forward_syncs_triggered += 1;
         }
-    } else if hdr.wd == guard.brain_wd && is_uuid_like(name) && sync_session(config, name).is_ok() {
-        stats.forward_syncs_triggered += 1;
     }
 }
 
@@ -229,8 +258,17 @@ fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut 
     }
 }
 
-/// Runs the real-time `inotify` watcher daemon and periodic deep-brain reconciliation loop.
+/// Runs the real-time `inotify` watcher daemon and automatic `bin/agy` signature patcher.
 pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
+    let mut stats = DaemonStats::default();
+    let bin_path = daemon_cfg.vault.agy_dir.join("bin/agy");
+    if let Ok(PatchOutcome::NewlyPatched(off)) = ensure_agy_binary_unbounded(&bin_path) {
+        stats.binary_patches_applied += 1;
+        println!(
+            "[agy-vault] patched agy binary at offset 0x{off:x} (MaxConversations: 500 -> 0)"
+        );
+    }
+    let _ = restore_all_from_vault(&daemon_cfg.vault);
     let initial = sync_all(&daemon_cfg.vault)?;
     println!(
         "[agy-vault] initial sync complete: active_db={}, brain_dirs={}, annotations={}, new_links={}, elapsed={}ms",
@@ -242,7 +280,6 @@ pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
     );
 
     let guard = InotifyGuard::new(&daemon_cfg.vault)?;
-    let mut stats = DaemonStats::default();
 
     loop {
         let mut pfd = PollFd {

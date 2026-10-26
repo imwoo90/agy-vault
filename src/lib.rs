@@ -25,8 +25,8 @@ pub use restore::{
     RestoreReport, VaultStatus, compute_status, resolve_vault_uuid, restore_session,
 };
 pub use shim::{
-    CliOptions, build_vault_config, extract_uuids_from_args, install_shim_script, parse_cli_args,
-    run_shim_exec,
+    CliOptions, PATCHED_MAX_CONVS_SIG, PatchOutcome, UNPATCHED_MAX_CONVS_SIG, build_vault_config,
+    ensure_agy_binary_unbounded, parse_cli_args, restore_all_from_vault,
 };
 pub use vault_engine::{
     LinkAction, SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_all, sync_session,

@@ -6,8 +6,9 @@
 //! 5. Transparent CLI shim (`shim-exec`) pre-restoration on `--resume <uuid>`
 
 use agy_vault::{
-    DaemonConfig, VaultConfig, compute_status, install_shim_script, restore_session, run_daemon,
-    run_shim_exec, sync_all, sync_session,
+    DaemonConfig, PATCHED_MAX_CONVS_SIG, PatchOutcome, UNPATCHED_MAX_CONVS_SIG, VaultConfig,
+    compute_status, ensure_agy_binary_unbounded, restore_all_from_vault, restore_session,
+    run_daemon, sync_all, sync_session,
 };
 use std::error::Error;
 use std::fs;
@@ -181,24 +182,27 @@ fn test_sqlite_wal_clean_checkpoint_cleanup() -> TestResult {
 }
 
 #[test]
-fn test_inotify_daemon_on_demand_swap_in_without_delete_thrashing() -> TestResult {
+fn test_inotify_daemon_auto_patches_binary_on_startup_and_update() -> TestResult {
     let (root, cfg) = create_temp_sandbox("inotify_daemon")?;
     let uuid_evicted = "33333333-4444-5555-6666-777777777777";
-    let uuid_pruned_live = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
     populate_mock_session(&cfg, uuid_evicted, b"EVICTED-DB-CONTENT", false)?;
-    populate_mock_session(&cfg, uuid_pruned_live, b"PRUNED-LIVE-DB-CONTENT", false)?;
     sync_all(&cfg)?;
 
     let active_db = cfg
         .active_conversations_dir()
         .join(format!("{uuid_evicted}.db"));
-    let live_pruned_db = cfg
-        .active_conversations_dir()
-        .join(format!("{uuid_pruned_live}.db"));
-
     fs::remove_file(&active_db)?;
     fs::remove_dir_all(cfg.active_brain_dir().join(uuid_evicted))?;
     assert!(!active_db.exists());
+
+    // Create a mock `bin/agy` containing the unpatched 500-conversation signature:
+    let bin_dir = cfg.agy_dir.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let bin_path = bin_dir.join("agy");
+    let mut mock_elf = vec![0x90u8; 64];
+    mock_elf.extend_from_slice(&UNPATCHED_MAX_CONVS_SIG);
+    mock_elf.extend_from_slice(&[0xc3u8; 32]);
+    fs::write(&bin_path, &mock_elf)?;
 
     let daemon_cfg = DaemonConfig {
         vault: cfg.clone(),
@@ -207,19 +211,22 @@ fn test_inotify_daemon_on_demand_swap_in_without_delete_thrashing() -> TestResul
     };
 
     let handle = thread::spawn(move || run_daemon(&daemon_cfg));
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(80));
 
-    // Simulate PruneAll unlinking uuid_pruned_live while daemon is watching:
-    // Daemon must NOT restore it on IN_DELETE (preventing startup thrashing),
-    // while keeping it 100% intact inside the vault!
-    fs::remove_file(&live_pruned_db)?;
-    fs::remove_dir_all(cfg.active_brain_dir().join(uuid_pruned_live))?;
+    // Verify startup patched `bin/agy` and restored `uuid_evicted` into active folder:
+    assert_eq!(
+        ensure_agy_binary_unbounded(&bin_path)?,
+        PatchOutcome::AlreadyPatched(64)
+    );
+    assert!(active_db.is_file());
 
-    // Trigger on-demand swap-in for uuid_evicted via annotation access/modify:
-    let ann_path = cfg
-        .active_annotations_dir()
-        .join(format!("{uuid_evicted}.pbtxt"));
-    fs::write(&ann_path, "title: \"Resumed Session\"\n")?;
+    // Simulate an `agy` auto-update overwriting `bin/agy` at a DIFFERENT offset (e.g. offset 128):
+    let mut updated_elf = vec![0x90u8; 128];
+    updated_elf.extend_from_slice(&UNPATCHED_MAX_CONVS_SIG);
+    updated_elf.extend_from_slice(&[0xc3u8; 32]);
+    let update_tmp = bin_dir.join("agy.update_tmp");
+    fs::write(&update_tmp, &updated_elf)?;
+    fs::rename(&update_tmp, &bin_path)?;
 
     let uuid_live = "44444444-5555-6666-7777-888888888888";
     populate_mock_session(&cfg, uuid_live, b"LIVE-CREATED-DB", false)?;
@@ -227,25 +234,16 @@ fn test_inotify_daemon_on_demand_swap_in_without_delete_thrashing() -> TestResul
     let stats = handle
         .join()
         .map_err(|_| "daemon thread panicked")??;
-    assert_eq!(stats.auto_restores_triggered, 1);
-    assert!(active_db.is_file());
-    assert_eq!(fs::read(&active_db)?, b"EVICTED-DB-CONTENT");
-    assert!(
-        cfg.active_brain_dir()
-            .join(uuid_evicted)
-            .join(".system_generated/logs/transcript.jsonl")
-            .is_file()
+    assert_eq!(stats.binary_patches_applied, 2);
+    assert_eq!(
+        ensure_agy_binary_unbounded(&bin_path)?,
+        PatchOutcome::AlreadyPatched(128)
     );
-
-    // Verify uuid_pruned_live stayed evicted from active working set, but survived in vault!
-    assert!(!live_pruned_db.exists());
-    let vault_pruned_db = cfg
-        .vault_conversations_dir()
-        .join(format!("{uuid_pruned_live}.db"));
-    assert!(vault_pruned_db.is_file());
-    assert_eq!(fs::read(&vault_pruned_db)?, b"PRUNED-LIVE-DB-CONTENT");
-    assert_eq!(fs::metadata(&vault_pruned_db)?.nlink(), 1);
-
+    let patched_bytes = fs::read(&bin_path)?;
+    assert_eq!(
+        &patched_bytes[128..128 + PATCHED_MAX_CONVS_SIG.len()],
+        &PATCHED_MAX_CONVS_SIG
+    );
     assert!(
         cfg.vault_conversations_dir()
             .join(format!("{uuid_live}.db"))
@@ -257,49 +255,45 @@ fn test_inotify_daemon_on_demand_swap_in_without_delete_thrashing() -> TestResul
 }
 
 #[test]
-fn test_cli_shim_pre_restores_resumed_session() -> TestResult {
-    let (root, cfg) = create_temp_sandbox("cli_shim")?;
-    let uuid = "55555555-6666-7777-8888-999999999999";
-    let uuid_unreferenced = "66666666-7777-8888-9999-aaaaaaaaaaaa";
-    populate_mock_session(&cfg, uuid, b"SHIM-RESTORE-DB", false)?;
-    populate_mock_session(&cfg, uuid_unreferenced, b"UNREFERENCED-DB", false)?;
+fn test_restore_all_from_vault_and_idempotent_binary_patch() -> TestResult {
+    let (root, cfg) = create_temp_sandbox("restore_all")?;
+    let uuid1 = "55555555-6666-7777-8888-999999999999";
+    let uuid2 = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    populate_mock_session(&cfg, uuid1, b"SESSION-ONE-DB", false)?;
+    populate_mock_session(&cfg, uuid2, b"SESSION-TWO-DB", false)?;
     sync_all(&cfg)?;
 
-    let active_db = cfg.active_conversations_dir().join(format!("{uuid}.db"));
-    let unref_db = cfg
-        .active_conversations_dir()
-        .join(format!("{uuid_unreferenced}.db"));
-    fs::remove_file(&active_db)?;
-    fs::remove_file(&unref_db)?;
-    assert!(!active_db.exists());
-    assert!(!unref_db.exists());
+    let active_db1 = cfg.active_conversations_dir().join(format!("{uuid1}.db"));
+    let active_db2 = cfg.active_conversations_dir().join(format!("{uuid2}.db"));
+    fs::remove_file(&active_db1)?;
+    fs::remove_file(&active_db2)?;
+    assert!(!active_db1.exists());
+    assert!(!active_db2.exists());
 
-    let mock_agy = root.join("mock_agy.sh");
-    let script = format!(
-        "#!/bin/sh\nif [ -f \"{}\" ]; then exit 0; else exit 42; fi\n",
-        active_db.display()
-    );
-    fs::write(&mock_agy, &script)?;
+    let restored_count = restore_all_from_vault(&cfg)?;
+    assert_eq!(restored_count, 2);
+    assert!(active_db1.is_file());
+    assert!(active_db2.is_file());
+    assert_eq!(fs::metadata(&active_db1)?.nlink(), 2);
+    assert_eq!(fs::metadata(&active_db2)?.nlink(), 2);
+
+    let mock_agy = root.join("agy_bin");
+    let mut payload = vec![0x90u8; 32];
+    payload.extend_from_slice(&UNPATCHED_MAX_CONVS_SIG);
+    payload.extend_from_slice(&[0xc3u8; 16]);
+    fs::write(&mock_agy, &payload)?;
     let mut perms = fs::metadata(&mock_agy)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&mock_agy, perms)?;
 
-    let args = vec!["--conversation".to_string(), uuid.to_string()];
-    let code = run_shim_exec(&cfg, &mock_agy, &args)?;
-    assert_eq!(code, 0);
-    assert!(active_db.is_file());
-    // Unreferenced evicted session must remain in vault only (on-demand swap-in):
-    assert!(!unref_db.exists());
-
-    let shim_out = root.join("bin/agy");
-    fs::create_dir_all(shim_out.parent().ok_or("no parent")?)?;
-    std::os::unix::fs::symlink(&mock_agy, &shim_out)?;
-    let installed =
-        install_shim_script(&shim_out, &PathBuf::from("/usr/bin/agy-vault"), &mock_agy)?;
-    assert!(installed.is_file());
-    assert!(!fs::symlink_metadata(&installed)?.file_type().is_symlink());
-    assert_eq!(fs::read_to_string(&mock_agy)?, script);
-    assert_eq!(fs::metadata(&installed)?.permissions().mode() & 0o111, 0o111);
+    assert_eq!(
+        ensure_agy_binary_unbounded(&mock_agy)?,
+        PatchOutcome::NewlyPatched(32)
+    );
+    assert_eq!(
+        ensure_agy_binary_unbounded(&mock_agy)?,
+        PatchOutcome::AlreadyPatched(32)
+    );
 
     let _ = fs::remove_dir_all(root);
     Ok(())

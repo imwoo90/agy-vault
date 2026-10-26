@@ -1,22 +1,149 @@
-//! # Transparent `agy` CLI Shim & Argument Parser
+//! # CLI Options & Binary Signature Patcher
 //!
 //! ## Overview
-//! Provides transparent command-line wrapping for the Google Antigravity CLI (`agy`). Inspects
-//! user CLI arguments for conversation UUIDs (`--resume <uuid>`, `-r <uuid>`, or bare UUIDs),
-//! automatically restores any garbage-collected session from `<vault_dir>` prior to invoking the
-//! real `agy` binary, and parses `agy-vault` CLI options.
+//! Parses `agy-vault` command-line flags, maintains vault index metadata, and implements the
+//! version-independent x86_64 machine-code signature scanner (`ensure_agy_binary_unbounded`) that
+//! patches Google Antigravity's `MaxConversations = 500` (`0x01f4`) constant to `0` (`unlimited`)
+//! across `agy` binary updates without requiring wrapper scripts.
 //!
 //! ## Search Tags
-//! #cli-shim, #arg-parser, #resume, #wrapper, #passthrough
+//! #binary-patcher, #signature-scanner, #cli-parser, #max-conversations, #unbounded
 
-use crate::restore::{compute_status, resolve_vault_uuid, restore_session};
-use crate::vault_engine::{SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_all};
+use crate::restore::{compute_status, restore_session};
+use crate::vault_engine::{SyncReport, VaultConfig, ensure_hardlink, is_uuid_like};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Unpatched x86_64 instruction signature in `CreateLanguageServerAndServe`:
+/// `test %dl,%dl; mov $0x1f4,%edx; mov $0x0,%r9d; cmovne %r9,%rdx` (`MaxConversations = 500`).
+pub const UNPATCHED_MAX_CONVS_SIG: [u8; 17] = [
+    0x84, 0xd2, 0xba, 0xf4, 0x01, 0x00, 0x00, 0x41, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x49, 0x0f,
+    0x45, 0xd1,
+];
+
+/// Patched x86_64 instruction signature setting `MaxConversations = 0` (unlimited, skips `PruneAll`).
+pub const PATCHED_MAX_CONVS_SIG: [u8; 17] = [
+    0x84, 0xd2, 0xba, 0x00, 0x00, 0x00, 0x00, 0x41, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x49, 0x0f,
+    0x45, 0xd1,
+];
+
+/// Outcome of scanning and patching the `agy` binary's `MaxConversations` limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOutcome {
+    /// Found the unpatched `500` (`0x01f4`) signature at byte offset and atomically patched it to `0`.
+    NewlyPatched(usize),
+    /// Binary already contains the patched `0` (`unlimited`) signature at byte offset.
+    AlreadyPatched(usize),
+    /// Binary did not exist or did not contain the signature.
+    SignatureNotFound,
+}
+
+/// Scans `bin_path` in 64 KB streaming chunks for a 17-byte signature without heap-allocating the file.
+fn find_signature_offset(bin_path: &Path, sig: &[u8; 17]) -> Result<Option<usize>, String> {
+    let mut file = fs::File::open(bin_path).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 65536];
+    let mut carry = [0u8; 16];
+    let mut carry_len = 0usize;
+    let mut file_off = 0usize;
+
+    loop {
+        let n = file.read(&mut buf[carry_len..]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf[..carry_len].copy_from_slice(&carry[..carry_len]);
+        let total = carry_len + n;
+        if let Some(pos) = buf[..total].windows(sig.len()).position(|w| w == sig) {
+            return Ok(Some(file_off - carry_len + pos));
+        }
+        file_off += n;
+        if total >= 16 {
+            carry.copy_from_slice(&buf[total - 16..total]);
+            carry_len = 16;
+        } else {
+            carry[..total].copy_from_slice(&buf[..total]);
+            carry_len = total;
+        }
+    }
+}
+
+/// Scans `bin_path` for the `MaxConversations = 500` x86_64 instruction signature and atomically
+/// patches it to `0` (`unlimited`) via kernel `copy` + `seek` + `rename(2)` with `< 64 KB` RAM usage.
+pub fn ensure_agy_binary_unbounded(bin_path: &Path) -> Result<PatchOutcome, String> {
+    if !bin_path.is_file() {
+        return Ok(PatchOutcome::SignatureNotFound);
+    }
+    if let Some(off) = find_signature_offset(bin_path, &UNPATCHED_MAX_CONVS_SIG)? {
+        let parent = bin_path.parent().ok_or("no parent dir for agy binary")?;
+        let tmp = parent.join(".agy.vault_patch_tmp");
+        let _ = fs::remove_file(&tmp);
+        fs::copy(bin_path, &tmp).map_err(|e| e.to_string())?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(off as u64))
+            .map_err(|e| e.to_string())?;
+        f.write_all(&PATCHED_MAX_CONVS_SIG)
+            .map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        let mut perms = fs::metadata(bin_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp, perms).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, bin_path).map_err(|e| e.to_string())?;
+        return Ok(PatchOutcome::NewlyPatched(off));
+    }
+    if let Some(off) = find_signature_offset(bin_path, &PATCHED_MAX_CONVS_SIG)? {
+        return Ok(PatchOutcome::AlreadyPatched(off));
+    }
+    Ok(PatchOutcome::SignatureNotFound)
+}
+
+/// Restores all vaulted sessions that are currently missing from the active directory.
+pub fn restore_all_from_vault(config: &VaultConfig) -> Result<usize, String> {
+    let mut restored = 0usize;
+    let mut vault_uuids = BTreeSet::new();
+    if let Ok(rd) = fs::read_dir(config.vault_conversations_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("db")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && is_uuid_like(stem)
+            {
+                vault_uuids.insert(stem.to_string());
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(config.vault_brain_dir()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+                && is_uuid_like(name)
+            {
+                vault_uuids.insert(name.to_string());
+            }
+        }
+    }
+    for uuid in vault_uuids {
+        let a_db = config.active_conversations_dir().join(format!("{uuid}.db"));
+        let v_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
+        let a_br = config.active_brain_dir().join(&uuid);
+        let v_br = config.vault_brain_dir().join(&uuid);
+        if ((v_db.is_file() && !a_db.is_file()) || (v_br.is_dir() && !a_br.is_dir()))
+            && restore_session(config, &uuid).is_ok()
+        {
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
 
 /// Hardlinks any historical `.pbtxt` annotations whose `.db` and `brain/` were already pruned.
 pub(crate) fn sync_orphan_annotations(
@@ -65,7 +192,7 @@ pub(crate) fn write_vault_index(config: &VaultConfig, last: &SyncReport) -> Resu
 /// Parsed CLI options and subcommands for `agy-vault`.
 #[derive(Debug, Clone)]
 pub struct CliOptions {
-    /// Active subcommand (`sync`, `status`, `restore`, `daemon`, `shim-exec`, `install-shim`, `help`).
+    /// Active subcommand (`sync`, `status`, `restore`, `daemon`, `patch-binary`, `help`).
     pub subcommand: String,
     /// Optional override for `~/.gemini/antigravity-cli`.
     pub agy_dir: Option<PathBuf>,
@@ -73,8 +200,6 @@ pub struct CliOptions {
     pub vault_dir: Option<PathBuf>,
     /// Optional override for the real `agy` binary path.
     pub real_agy: Option<PathBuf>,
-    /// Optional override for the installed shim script path.
-    pub shim_path: Option<PathBuf>,
     /// Target conversation UUID or prefix for `restore`.
     pub target_uuid: Option<String>,
     /// Poll timeout in milliseconds for `daemon`.
@@ -83,8 +208,6 @@ pub struct CliOptions {
     pub max_ticks: Option<usize>,
     /// Whether to emit machine-readable JSON output.
     pub json_output: bool,
-    /// Passthrough arguments forwarded to the real `agy` binary in `shim-exec`.
-    pub passthrough_args: Vec<String>,
 }
 
 impl Default for CliOptions {
@@ -94,12 +217,10 @@ impl Default for CliOptions {
             agy_dir: None,
             vault_dir: None,
             real_agy: None,
-            shim_path: None,
             target_uuid: None,
             poll_ms: 1000,
             max_ticks: None,
             json_output: false,
-            passthrough_args: Vec::new(),
         }
     }
 }
@@ -132,14 +253,6 @@ fn parse_valued_flag(
             *idx += 1;
             opts.real_agy = Some(PathBuf::from(
                 raw_args.get(*idx).ok_or("--real-agy requires a path")?,
-            ));
-            *idx += 1;
-            Ok(true)
-        }
-        "--shim-path" => {
-            *idx += 1;
-            opts.shim_path = Some(PathBuf::from(
-                raw_args.get(*idx).ok_or("--shim-path requires a path")?,
             ));
             *idx += 1;
             Ok(true)
@@ -184,10 +297,7 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliOptions, String> {
 
     while idx < raw_args.len() {
         let arg = &raw_args[idx];
-        if arg == "--" {
-            opts.passthrough_args.extend_from_slice(&raw_args[idx + 1..]);
-            break;
-        } else if arg == "--json" {
+        if arg == "--json" {
             opts.json_output = true;
             idx += 1;
         } else if arg == "--help" || arg == "-h" {
@@ -216,108 +326,4 @@ pub fn build_vault_config(opts: &CliOptions) -> Result<VaultConfig, String> {
         cfg.vault_dir = vault.clone();
     }
     Ok(cfg)
-}
-
-/// Extracts candidate conversation UUIDs or `--resume` / `-r` query prefixes from CLI arguments.
-///
-/// # Examples
-/// ```
-/// use agy_vault::extract_uuids_from_args;
-///
-/// let args = vec![
-///     "--resume".to_string(),
-///     "cc892e65-120e-48f3-b0cc-4ac54395db11".to_string(),
-/// ];
-/// let found = extract_uuids_from_args(&args);
-/// assert_eq!(found, vec!["cc892e65-120e-48f3-b0cc-4ac54395db11".to_string()]);
-/// ```
-pub fn extract_uuids_from_args(args: &[String]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    let mut iter = args.iter().peekable();
-
-    while let Some(arg) = iter.next() {
-        if arg == "--resume"
-            || arg == "-r"
-            || arg == "--conversation"
-            || arg == "--conversation-id"
-        {
-            if let Some(next_val) = iter.peek()
-                && !next_val.starts_with('-')
-            {
-                set.insert((*next_val).clone());
-            }
-        } else if let Some(val) = arg
-            .strip_prefix("--resume=")
-            .or_else(|| arg.strip_prefix("--conversation="))
-            .or_else(|| arg.strip_prefix("--conversation-id="))
-        {
-            if !val.is_empty() {
-                set.insert(val.to_string());
-            }
-        } else if is_uuid_like(arg) {
-            set.insert(arg.clone());
-        }
-    }
-
-    set.into_iter().collect()
-}
-
-/// Executes the transparent CLI shim: swaps in and promotes any referenced session from the vault
-/// on demand (`mtime = now`), and then executes the real `agy` binary with all user arguments.
-pub fn run_shim_exec(
-    config: &VaultConfig,
-    real_agy_bin: &Path,
-    passthrough_args: &[String],
-) -> Result<i32, String> {
-    let candidates = extract_uuids_from_args(passthrough_args);
-    for candidate in &candidates {
-        if let Ok(uuid) = resolve_vault_uuid(config, candidate) {
-            let _ = restore_session(config, &uuid);
-        }
-    }
-
-    if std::env::var("AGY_VAULT_SHIM_EXECVE").as_deref() == Ok("1") {
-        use std::os::unix::process::CommandExt;
-        let err = Command::new(real_agy_bin).args(passthrough_args).exec();
-        return Err(format!("failed to exec {}: {}", real_agy_bin.display(), err));
-    }
-
-    let status = Command::new(real_agy_bin)
-        .args(passthrough_args)
-        .status()
-        .map_err(|e| format!("failed to execute {}: {}", real_agy_bin.display(), e))?;
-
-    let _ = sync_all(config);
-    Ok(status.code().unwrap_or(1))
-}
-
-/// Installs an executable POSIX shell shim script at `shim_path` (e.g. `~/.local/bin/agy`)
-/// that wraps `real_agy_bin` through `agy-vault shim-exec`.
-pub fn install_shim_script(
-    shim_path: &Path,
-    vault_bin: &Path,
-    real_agy_bin: &Path,
-) -> Result<PathBuf, String> {
-    if shim_path == real_agy_bin {
-        return Err("shim_path and real_agy_bin cannot be the same path".to_string());
-    }
-    if let Some(parent) = shim_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    // Always unlink existing file or symlink first so we never follow a symlink to real_agy_bin!
-    if fs::symlink_metadata(shim_path).is_ok() {
-        fs::remove_file(shim_path).map_err(|e| e.to_string())?;
-    }
-    let script = format!(
-        "#!/bin/sh\n# Auto-generated by agy-vault: Transparent Zero-Knowledge Antigravity Session Shim\nAGY_VAULT_SHIM_EXECVE=1 exec \"{}\" shim-exec --real-agy \"{}\" -- \"$@\"\n",
-        vault_bin.display(),
-        real_agy_bin.display()
-    );
-    fs::write(shim_path, script).map_err(|e| e.to_string())?;
-    let mut perms = fs::metadata(shim_path)
-        .map_err(|e| e.to_string())?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(shim_path, perms).map_err(|e| e.to_string())?;
-    Ok(shim_path.to_path_buf())
 }
