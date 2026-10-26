@@ -9,7 +9,7 @@
 //! ## Search Tags
 //! #cli-shim, #arg-parser, #resume, #wrapper, #passthrough
 
-use crate::restore::{compute_status, heal_evicted_sessions, resolve_vault_uuid, restore_session};
+use crate::restore::{compute_status, resolve_vault_uuid, restore_session};
 use crate::vault_engine::{SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_all};
 use std::collections::BTreeSet;
 use std::fs;
@@ -236,7 +236,11 @@ pub fn extract_uuids_from_args(args: &[String]) -> Vec<String> {
     let mut iter = args.iter().peekable();
 
     while let Some(arg) = iter.next() {
-        if arg == "--resume" || arg == "-r" || arg == "--conversation-id" {
+        if arg == "--resume"
+            || arg == "-r"
+            || arg == "--conversation"
+            || arg == "--conversation-id"
+        {
             if let Some(next_val) = iter.peek()
                 && !next_val.starts_with('-')
             {
@@ -244,6 +248,7 @@ pub fn extract_uuids_from_args(args: &[String]) -> Vec<String> {
             }
         } else if let Some(val) = arg
             .strip_prefix("--resume=")
+            .or_else(|| arg.strip_prefix("--conversation="))
             .or_else(|| arg.strip_prefix("--conversation-id="))
         {
             if !val.is_empty() {
@@ -257,21 +262,17 @@ pub fn extract_uuids_from_args(args: &[String]) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Executes the transparent CLI shim: pre-restores any referenced pruned session from the vault,
-/// and then executes the real `agy` binary with all user arguments.
+/// Executes the transparent CLI shim: swaps in and promotes any referenced session from the vault
+/// on demand (`mtime = now`), and then executes the real `agy` binary with all user arguments.
 pub fn run_shim_exec(
     config: &VaultConfig,
     real_agy_bin: &Path,
     passthrough_args: &[String],
 ) -> Result<i32, String> {
-    let _ = heal_evicted_sessions(config);
     let candidates = extract_uuids_from_args(passthrough_args);
     for candidate in &candidates {
         if let Ok(uuid) = resolve_vault_uuid(config, candidate) {
-            let active_db = config.active_conversations_dir().join(format!("{uuid}.db"));
-            if !active_db.is_file() {
-                let _ = restore_session(config, &uuid);
-            }
+            let _ = restore_session(config, &uuid);
         }
     }
 
@@ -287,7 +288,6 @@ pub fn run_shim_exec(
         .map_err(|e| format!("failed to execute {}: {}", real_agy_bin.display(), e))?;
 
     let _ = sync_all(config);
-    let _ = heal_evicted_sessions(config);
     Ok(status.code().unwrap_or(1))
 }
 

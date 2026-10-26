@@ -9,15 +9,12 @@
 //! ## Search Tags
 //! #inotify, #daemon, #auto-restore, #linux-syscalls, #real-time
 
-use crate::restore::{heal_evicted_sessions, restore_session};
+use crate::restore::restore_session;
 use crate::vault_engine::{VaultConfig, is_uuid_like, sync_all, sync_session};
-use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::thread;
-use std::time::Duration;
 
 const IN_ACCESS: u32 = 0x0000_0001;
 const IN_MODIFY: u32 = 0x0000_0002;
@@ -26,7 +23,6 @@ const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 const IN_OPEN: u32 = 0x0000_0020;
 const IN_MOVED_TO: u32 = 0x0000_0080;
 const IN_CREATE: u32 = 0x0000_0100;
-const IN_DELETE: u32 = 0x0000_0200;
 
 const IN_CLOEXEC: i32 = 0o2000000;
 const IN_NONBLOCK: i32 = 0o0004000;
@@ -99,9 +95,8 @@ impl InotifyGuard {
             return Err("inotify_init1 syscall failed".to_string());
         }
 
-        let conv_mask =
-            IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_ATTRIB;
-        let brain_mask = IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_DELETE;
+        let conv_mask = IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB;
+        let brain_mask = IN_CREATE | IN_MOVED_TO | IN_MODIFY;
         let ann_mask = IN_ACCESS | IN_OPEN | IN_MODIFY | IN_CREATE | IN_MOVED_TO;
 
         let conversations_wd = Self::add_watch(fd, &config.active_conversations_dir(), conv_mask)?;
@@ -183,7 +178,6 @@ fn handle_inotify_event(
     guard: &InotifyGuard,
     hdr: &InotifyEventHeader,
     name: &str,
-    deleted_uuids: &mut BTreeSet<String>,
     stats: &mut DaemonStats,
 ) {
     if name.is_empty() || name.starts_with('.') {
@@ -192,30 +186,20 @@ fn handle_inotify_event(
     if hdr.wd == guard.annotations_wd {
         handle_annotation_event(config, hdr.mask, name, stats);
     } else if hdr.wd == guard.conversations_wd {
-        if (hdr.mask & IN_DELETE) != 0
-            && let Some(uuid) = name.strip_suffix(".db").filter(|u| is_uuid_like(u))
-        {
-            deleted_uuids.insert(uuid.to_string());
-        } else if let Some(uuid) = extract_conversation_uuid(name)
+        if let Some(uuid) = extract_conversation_uuid(name)
             && sync_session(config, uuid).is_ok()
         {
             stats.forward_syncs_triggered += 1;
         }
-    } else if hdr.wd == guard.brain_wd && is_uuid_like(name) {
-        if (hdr.mask & IN_DELETE) != 0 {
-            deleted_uuids.insert(name.to_string());
-        } else if sync_session(config, name).is_ok() {
-            stats.forward_syncs_triggered += 1;
-        }
+    } else if hdr.wd == guard.brain_wd && is_uuid_like(name) && sync_session(config, name).is_ok() {
+        stats.forward_syncs_triggered += 1;
     }
 }
 
-/// Drains all pending events from the non-blocking `inotify` descriptor and auto-heals any
-/// sessions unlinked by `PruneAll`.
+/// Drains all pending events from the non-blocking `inotify` descriptor.
 fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut DaemonStats) {
     let mut buf = [0u8; 16384];
     let hdr_sz = std::mem::size_of::<InotifyEventHeader>();
-    let mut deleted = BTreeSet::new();
 
     loop {
         // SAFETY: `buf` is a stack array of 16384 bytes and `guard.fd` is non-blocking.
@@ -238,21 +222,9 @@ fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut 
             let end = slice.iter().position(|&b| b == 0).unwrap_or(nlen);
             if let Ok(s) = std::str::from_utf8(&slice[..end]) {
                 stats.inotify_events_processed += 1;
-                handle_inotify_event(config, guard, &hdr, s, &mut deleted, stats);
+                handle_inotify_event(config, guard, &hdr, s, stats);
             }
             off += nlen;
-        }
-    }
-    if !deleted.is_empty() {
-        thread::sleep(Duration::from_millis(20));
-        for uuid in deleted {
-            if let Ok(rep) = restore_session(config, &uuid) {
-                stats.auto_restores_triggered += 1;
-                println!(
-                    "[agy-vault] auto-healed GC-evicted session {} in {} us",
-                    rep.uuid, rep.elapsed_micros
-                );
-            }
         }
     }
 }
@@ -260,22 +232,17 @@ fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut 
 /// Runs the real-time `inotify` watcher daemon and periodic deep-brain reconciliation loop.
 pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
     let initial = sync_all(&daemon_cfg.vault)?;
-    let initial_healed = heal_evicted_sessions(&daemon_cfg.vault).unwrap_or(0);
     println!(
-        "[agy-vault] initial sync complete: active_db={}, brain_dirs={}, annotations={}, new_links={}, auto_healed={}, elapsed={}ms",
+        "[agy-vault] initial sync complete: active_db={}, brain_dirs={}, annotations={}, new_links={}, elapsed={}ms",
         initial.active_db_synced,
         initial.brain_dirs_synced,
         initial.annotations_synced,
         initial.hardlinks_created,
-        initial_healed,
         initial.elapsed_ms
     );
 
     let guard = InotifyGuard::new(&daemon_cfg.vault)?;
-    let mut stats = DaemonStats {
-        auto_restores_triggered: initial_healed,
-        ..DaemonStats::default()
-    };
+    let mut stats = DaemonStats::default();
 
     loop {
         let mut pfd = PollFd {
@@ -290,11 +257,6 @@ pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
         }
 
         stats.ticks_completed += 1;
-        if stats.ticks_completed.is_multiple_of(5)
-            && let Ok(healed) = heal_evicted_sessions(&daemon_cfg.vault)
-        {
-            stats.auto_restores_triggered += healed;
-        }
         if stats.ticks_completed.is_multiple_of(300) {
             let _ = sync_all(&daemon_cfg.vault);
         }

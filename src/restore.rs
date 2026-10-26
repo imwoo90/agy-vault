@@ -13,10 +13,38 @@ use crate::vault_engine::{
     SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_directory_recursive,
 };
 use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Instant;
+
+const AT_FDCWD: i32 = -100;
+
+unsafe extern "C" {
+    fn utimensat(dirfd: i32, pathname: *const i8, times: *const libc_timespec, flags: i32) -> i32;
+}
+
+#[repr(C)]
+struct libc_timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Promotes `path`'s modification and access timestamps (`mtime`/`atime`) to current wall-clock time
+/// (`UTIME_NOW`) so a swapped-in session ranks #1 in Antigravity's 500-session LRU working set.
+fn touch_file_mtime_now(path: &Path) -> Result<(), String> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("invalid NUL byte in path {}", path.display()))?;
+    // SAFETY: Passing NULL `times` to `utimensat` with `AT_FDCWD` sets both atime and mtime to current time.
+    let rc = unsafe { utimensat(AT_FDCWD, c_path.as_ptr(), std::ptr::null(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("utimensat failed for {}", path.display()))
+    }
+}
 
 /// Quantitative report emitted by [`restore_session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,13 +130,14 @@ pub fn resolve_vault_uuid(config: &VaultConfig, query: &str) -> Result<String, S
 }
 
 /// Restores SQLite `.db`, `.db-wal`, and `.db-shm` files for `uuid` from vault to active
-/// while preserving the original `ext4` inode modification timestamp (`mtime`).
+/// and promotes the `.db` inode modification timestamp (`mtime`) to `now` for LRU retention.
 fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize), String> {
     let mut db_restored = false;
     let v_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
     let a_db = config.active_conversations_dir().join(format!("{uuid}.db"));
     if v_db.is_file() {
         ensure_hardlink(&v_db, &a_db)?;
+        let _ = touch_file_mtime_now(&a_db);
         db_restored = true;
     }
     let mut wal_restored = 0usize;
@@ -117,6 +146,7 @@ fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize
         let a_c = config.active_conversations_dir().join(format!("{uuid}.{suffix}"));
         if v_c.is_file() {
             ensure_hardlink(&v_c, &a_c)?;
+            let _ = touch_file_mtime_now(&a_c);
             wal_restored += 1;
         }
     }
@@ -225,36 +255,6 @@ pub fn compute_status(config: &VaultConfig) -> Result<VaultStatus, String> {
     }
     accumulate_vault_file_metrics(&config.vault_dir, &mut st)?;
     Ok(st)
-}
-
-/// Automatically re-hardlinks any session present in `<vault_dir>` whose `.db` or `brain/<uuid>`
-/// directory was unlinked from `<agy_dir>` by Antigravity's 500-conversation `PruneAll` GC.
-pub fn heal_evicted_sessions(config: &VaultConfig) -> Result<usize, String> {
-    let mut evicted = BTreeSet::new();
-    if let Ok(rd) = fs::read_dir(config.vault_conversations_dir()) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("db")
-                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-                && is_uuid_like(stem)
-                && !config.active_conversations_dir().join(format!("{stem}.db")).is_file()
-            {
-                evicted.insert(stem.to_string());
-            }
-        }
-    }
-    if let Ok(rd) = fs::read_dir(config.vault_brain_dir()) {
-        for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = e.file_name().to_str()
-                && is_uuid_like(name)
-                && !config.active_brain_dir().join(name).is_dir()
-            {
-                evicted.insert(name.to_string());
-            }
-        }
-    }
-    Ok(evicted.into_iter().filter(|u| restore_session(config, u).is_ok()).count())
 }
 
 /// Walks `<vault_dir>` recursively to tally `nlink >= 2` (shared) vs `nlink == 1` (vault-only) files.

@@ -181,7 +181,7 @@ fn test_sqlite_wal_clean_checkpoint_cleanup() -> TestResult {
 }
 
 #[test]
-fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> TestResult {
+fn test_inotify_daemon_on_demand_swap_in_without_delete_thrashing() -> TestResult {
     let (root, cfg) = create_temp_sandbox("inotify_daemon")?;
     let uuid_evicted = "33333333-4444-5555-6666-777777777777";
     let uuid_pruned_live = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
@@ -195,7 +195,6 @@ fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> Test
     let live_pruned_db = cfg
         .active_conversations_dir()
         .join(format!("{uuid_pruned_live}.db"));
-    let orig_mtime = fs::metadata(&live_pruned_db)?.mtime();
 
     fs::remove_file(&active_db)?;
     fs::remove_dir_all(cfg.active_brain_dir().join(uuid_evicted))?;
@@ -210,9 +209,17 @@ fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> Test
     let handle = thread::spawn(move || run_daemon(&daemon_cfg));
     thread::sleep(Duration::from_millis(60));
 
-    // Simulate PruneAll unlinking uuid_pruned_live while daemon is watching!
+    // Simulate PruneAll unlinking uuid_pruned_live while daemon is watching:
+    // Daemon must NOT restore it on IN_DELETE (preventing startup thrashing),
+    // while keeping it 100% intact inside the vault!
     fs::remove_file(&live_pruned_db)?;
     fs::remove_dir_all(cfg.active_brain_dir().join(uuid_pruned_live))?;
+
+    // Trigger on-demand swap-in for uuid_evicted via annotation access/modify:
+    let ann_path = cfg
+        .active_annotations_dir()
+        .join(format!("{uuid_evicted}.pbtxt"));
+    fs::write(&ann_path, "title: \"Resumed Session\"\n")?;
 
     let uuid_live = "44444444-5555-6666-7777-888888888888";
     populate_mock_session(&cfg, uuid_live, b"LIVE-CREATED-DB", false)?;
@@ -220,18 +227,25 @@ fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> Test
     let stats = handle
         .join()
         .map_err(|_| "daemon thread panicked")??;
-    assert!(stats.auto_restores_triggered >= 2);
+    assert_eq!(stats.auto_restores_triggered, 1);
     assert!(active_db.is_file());
     assert_eq!(fs::read(&active_db)?, b"EVICTED-DB-CONTENT");
-    assert!(live_pruned_db.is_file());
-    assert_eq!(fs::read(&live_pruned_db)?, b"PRUNED-LIVE-DB-CONTENT");
-    assert_eq!(fs::metadata(&live_pruned_db)?.mtime(), orig_mtime);
     assert!(
         cfg.active_brain_dir()
-            .join(uuid_pruned_live)
+            .join(uuid_evicted)
             .join(".system_generated/logs/transcript.jsonl")
             .is_file()
     );
+
+    // Verify uuid_pruned_live stayed evicted from active working set, but survived in vault!
+    assert!(!live_pruned_db.exists());
+    let vault_pruned_db = cfg
+        .vault_conversations_dir()
+        .join(format!("{uuid_pruned_live}.db"));
+    assert!(vault_pruned_db.is_file());
+    assert_eq!(fs::read(&vault_pruned_db)?, b"PRUNED-LIVE-DB-CONTENT");
+    assert_eq!(fs::metadata(&vault_pruned_db)?.nlink(), 1);
+
     assert!(
         cfg.vault_conversations_dir()
             .join(format!("{uuid_live}.db"))
@@ -246,12 +260,19 @@ fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> Test
 fn test_cli_shim_pre_restores_resumed_session() -> TestResult {
     let (root, cfg) = create_temp_sandbox("cli_shim")?;
     let uuid = "55555555-6666-7777-8888-999999999999";
+    let uuid_unreferenced = "66666666-7777-8888-9999-aaaaaaaaaaaa";
     populate_mock_session(&cfg, uuid, b"SHIM-RESTORE-DB", false)?;
+    populate_mock_session(&cfg, uuid_unreferenced, b"UNREFERENCED-DB", false)?;
     sync_all(&cfg)?;
 
     let active_db = cfg.active_conversations_dir().join(format!("{uuid}.db"));
+    let unref_db = cfg
+        .active_conversations_dir()
+        .join(format!("{uuid_unreferenced}.db"));
     fs::remove_file(&active_db)?;
+    fs::remove_file(&unref_db)?;
     assert!(!active_db.exists());
+    assert!(!unref_db.exists());
 
     let mock_agy = root.join("mock_agy.sh");
     let script = format!(
@@ -263,10 +284,12 @@ fn test_cli_shim_pre_restores_resumed_session() -> TestResult {
     perms.set_mode(0o755);
     fs::set_permissions(&mock_agy, perms)?;
 
-    let args = vec!["--resume".to_string(), "55555555".to_string()];
+    let args = vec!["--conversation".to_string(), uuid.to_string()];
     let code = run_shim_exec(&cfg, &mock_agy, &args)?;
     assert_eq!(code, 0);
     assert!(active_db.is_file());
+    // Unreferenced evicted session must remain in vault only (on-demand swap-in):
+    assert!(!unref_db.exists());
 
     let shim_out = root.join("bin/agy");
     fs::create_dir_all(shim_out.parent().ok_or("no parent")?)?;
