@@ -142,9 +142,9 @@ fn test_sqlite_wal_clean_checkpoint_cleanup() -> TestResult {
             .is_file()
     );
     assert!(
-        cfg.vault_conversations_dir()
+        !cfg.vault_conversations_dir()
             .join(format!("{uuid}.db-shm"))
-            .is_file()
+            .exists()
     );
 
     fs::write(
@@ -161,7 +161,7 @@ fn test_sqlite_wal_clean_checkpoint_cleanup() -> TestResult {
     )?;
 
     let rep2 = sync_session(&cfg, uuid)?;
-    assert_eq!(rep2.stale_wal_cleaned, 2);
+    assert_eq!(rep2.stale_wal_cleaned, 1);
     assert!(
         !cfg.vault_conversations_dir()
             .join(format!("{uuid}.db-wal"))

@@ -230,51 +230,41 @@ pub(crate) fn sync_directory_recursive(
 
 /// Synchronizes a single conversation `<uuid>` (SQLite `.db*`, `brain/<uuid>/**`, and `.pbtxt`)
 /// from the active Antigravity directory into the vault.
-pub fn sync_session(config: &VaultConfig, uuid: &str) -> Result<SyncReport, String> {
+pub fn sync_session(cfg: &VaultConfig, uuid: &str) -> Result<SyncReport, String> {
     let start = Instant::now();
-    config.ensure_vault_dirs()?;
-    let mut report = SyncReport::default();
+    cfg.ensure_vault_dirs()?;
+    let mut rep = SyncReport::default();
+    let (a_dir, v_dir) = (cfg.active_conversations_dir(), cfg.vault_conversations_dir());
+    let (a_db, v_db) = (a_dir.join(format!("{uuid}.db")), v_dir.join(format!("{uuid}.db")));
 
-    let active_db = config.active_conversations_dir().join(format!("{uuid}.db"));
-    let vault_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
+    if a_db.is_file() {
+        rep.record_action(ensure_hardlink(&a_db, &v_db)?);
+        rep.active_db_synced += 1;
 
-    if active_db.is_file() {
-        report.record_action(ensure_hardlink(&active_db, &vault_db)?);
-        report.active_db_synced += 1;
-
-        for suffix in ["db-wal", "db-shm"] {
-            let active_comp = config
-                .active_conversations_dir()
-                .join(format!("{uuid}.{suffix}"));
-            let vault_comp = config
-                .vault_conversations_dir()
-                .join(format!("{uuid}.{suffix}"));
-            if active_comp.is_file() {
-                report.record_action(ensure_hardlink(&active_comp, &vault_comp)?);
-            } else if vault_comp.exists() && fs::remove_file(&vault_comp).is_ok() {
-                report.stale_wal_cleaned += 1;
-            }
+        let (a_wal, v_wal) = (a_dir.join(format!("{uuid}.db-wal")), v_dir.join(format!("{uuid}.db-wal")));
+        if fs::metadata(&a_wal).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            rep.record_action(ensure_hardlink(&a_wal, &v_wal)?);
+        } else if v_wal.exists() && fs::remove_file(&v_wal).is_ok() {
+            rep.stale_wal_cleaned += 1;
         }
+        let _ = fs::remove_file(v_dir.join(format!("{uuid}.db-shm")));
     }
 
-    let active_brain = config.active_brain_dir().join(uuid);
-    let vault_brain = config.vault_brain_dir().join(uuid);
-    if active_brain.is_dir() {
-        sync_directory_recursive(&active_brain, &vault_brain, &mut report)?;
-        report.brain_dirs_synced += 1;
+    let (a_br, v_br) = (cfg.active_brain_dir().join(uuid), cfg.vault_brain_dir().join(uuid));
+    if a_br.is_dir() {
+        sync_directory_recursive(&a_br, &v_br, &mut rep)?;
+        rep.brain_dirs_synced += 1;
     }
 
-    let active_ann = config
-        .active_annotations_dir()
-        .join(format!("{uuid}.pbtxt"));
-    let vault_ann = config.vault_annotations_dir().join(format!("{uuid}.pbtxt"));
-    if active_ann.is_file() {
-        report.record_action(ensure_hardlink(&active_ann, &vault_ann)?);
-        report.annotations_synced += 1;
+    let a_ann = cfg.active_annotations_dir().join(format!("{uuid}.pbtxt"));
+    let v_ann = cfg.vault_annotations_dir().join(format!("{uuid}.pbtxt"));
+    if a_ann.is_file() {
+        rep.record_action(ensure_hardlink(&a_ann, &v_ann)?);
+        rep.annotations_synced += 1;
     }
 
-    report.elapsed_ms = start.elapsed().as_millis();
-    Ok(report)
+    rep.elapsed_ms = start.elapsed().as_millis();
+    Ok(rep)
 }
 
 /// Synchronizes all active conversations, brain directories, and annotations into the vault.

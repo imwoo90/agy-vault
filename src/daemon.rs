@@ -15,6 +15,7 @@ use crate::vault_engine::{VaultConfig, is_uuid_like, sync_all, sync_session};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 const IN_ACCESS: u32 = 0x0000_0001;
@@ -29,6 +30,8 @@ const IN_DELETE: u32 = 0x0000_0200;
 const IN_CLOEXEC: i32 = 0o2000000;
 const IN_NONBLOCK: i32 = 0o0004000;
 const POLLIN: i16 = 0x0001;
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
 
 #[repr(C)]
 struct PollFd {
@@ -51,6 +54,7 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn close(fd: i32) -> i32;
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 /// Configuration for the real-time `inotify` watcher daemon.
@@ -144,41 +148,33 @@ impl Drop for InotifyGuard {
     }
 }
 
-/// Extracts a canonical UUID from a conversation database filename (`<uuid>.db`, `.db-wal`, `.db-shm`).
-fn extract_conversation_uuid(file_name: &str) -> Option<&str> {
-    let stem = file_name
-        .strip_suffix(".db")
-        .or_else(|| file_name.strip_suffix(".db-wal"))
-        .or_else(|| file_name.strip_suffix(".db-shm"))?;
-    if is_uuid_like(stem) {
-        Some(stem)
-    } else {
-        None
+/// Extracts a canonical UUID from a conversation database filename (`<uuid>.db` or `.db-wal`).
+fn extract_conversation_uuid(name: &str) -> Option<(&str, bool)> {
+    if let Some(s) = name.strip_suffix(".db").filter(|u| is_uuid_like(u)) {
+        return Some((s, true));
     }
+    name.strip_suffix(".db-wal")
+        .filter(|u| is_uuid_like(u))
+        .map(|s| (s, false))
 }
 
 /// Handles an `inotify` event inside `<agy_dir>/annotations`.
-fn handle_annotation_event(config: &VaultConfig, mask: u32, name: &str, stats: &mut DaemonStats) {
+fn handle_annotation_event(cfg: &VaultConfig, mask: u32, name: &str, stats: &mut DaemonStats) {
     let Some(uuid) = name.strip_suffix(".pbtxt").filter(|u| is_uuid_like(u)) else {
         return;
     };
     if (mask & (IN_ACCESS | IN_OPEN | IN_MODIFY)) != 0 {
-        let a_db = config.active_conversations_dir().join(format!("{uuid}.db"));
-        let v_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
-        let v_br = config.vault_brain_dir().join(uuid);
+        let a_db = cfg.active_conversations_dir().join(format!("{uuid}.db"));
+        let v_db = cfg.vault_conversations_dir().join(format!("{uuid}.db"));
         if !a_db.is_file()
-            && (v_db.is_file() || v_br.is_dir())
-            && let Ok(rep) = restore_session(config, uuid)
+            && (v_db.is_file() || cfg.vault_brain_dir().join(uuid).is_dir())
+            && restore_session(cfg, uuid).is_ok()
         {
             stats.auto_restores_triggered += 1;
-            println!(
-                "[agy-vault] auto-restored session {} in {} us (db={}, brain_files={})",
-                rep.uuid, rep.elapsed_micros, rep.db_restored, rep.brain_files_restored
-            );
         }
     }
     if (mask & (IN_CREATE | IN_MOVED_TO | IN_MODIFY)) != 0 {
-        let _ = sync_session(config, uuid);
+        let _ = sync_session(cfg, uuid);
     }
 }
 
@@ -205,9 +201,9 @@ fn handle_inotify_event(
     } else if hdr.wd == guard.annotations_wd {
         handle_annotation_event(config, hdr.mask, name, stats);
     } else if hdr.wd == guard.conversations_wd {
-        if let Some(uuid) = extract_conversation_uuid(name) {
+        if let Some((uuid, is_main_db)) = extract_conversation_uuid(name) {
             if (hdr.mask & IN_DELETE) != 0 {
-                if restore_session(config, uuid).is_ok() {
+                if is_main_db && restore_session(config, uuid).is_ok() {
                     stats.auto_restores_triggered += 1;
                 }
             } else if sync_session(config, uuid).is_ok() {
@@ -258,9 +254,30 @@ fn drain_inotify_events(config: &VaultConfig, guard: &InotifyGuard, stats: &mut 
     }
 }
 
+fn acquire_daemon_lock(cfg: &VaultConfig) -> Result<Option<fs::File>, String> {
+    cfg.ensure_vault_dirs()?;
+    let lock_path = cfg.vault_dir.join(".daemon.lock");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| e.to_string())?;
+    // SAFETY: `f.as_raw_fd()` is a valid open file descriptor.
+    if unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        println!("[agy-vault] lock already held on {}; exiting.", lock_path.display());
+        return Ok(None);
+    }
+    Ok(Some(f))
+}
+
 /// Runs the real-time `inotify` watcher daemon and automatic `bin/agy` signature patcher.
 pub fn run_daemon(daemon_cfg: &DaemonConfig) -> Result<DaemonStats, String> {
     let mut stats = DaemonStats::default();
+    let Some(_lock_guard) = acquire_daemon_lock(&daemon_cfg.vault)? else {
+        return Ok(stats);
+    };
+
     let bin_path = daemon_cfg.vault.agy_dir.join("bin/agy");
     if let Ok(PatchOutcome::NewlyPatched(off)) = ensure_agy_binary_unbounded(&bin_path) {
         stats.binary_patches_applied += 1;

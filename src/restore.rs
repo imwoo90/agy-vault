@@ -129,8 +129,9 @@ pub fn resolve_vault_uuid(config: &VaultConfig, query: &str) -> Result<String, S
     }
 }
 
-/// Restores SQLite `.db`, `.db-wal`, and `.db-shm` files for `uuid` from vault to active
+/// Restores SQLite `.db` and non-empty `.db-wal` files for `uuid` from vault to active
 /// and promotes the `.db` inode modification timestamp (`mtime`) to `now` for LRU retention.
+/// Never restores `.db-shm` so SQLite cleanly rebuilds its `mmap` WAL-index without `SIGBUS`.
 fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize), String> {
     let mut db_restored = false;
     let v_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
@@ -141,14 +142,15 @@ fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize
         db_restored = true;
     }
     let mut wal_restored = 0usize;
-    for suffix in ["db-wal", "db-shm"] {
-        let v_c = config.vault_conversations_dir().join(format!("{uuid}.{suffix}"));
-        let a_c = config.active_conversations_dir().join(format!("{uuid}.{suffix}"));
-        if v_c.is_file() {
-            ensure_hardlink(&v_c, &a_c)?;
-            let _ = touch_file_mtime_now(&a_c);
-            wal_restored += 1;
-        }
+    let v_wal = config.vault_conversations_dir().join(format!("{uuid}.db-wal"));
+    let a_wal = config.active_conversations_dir().join(format!("{uuid}.db-wal"));
+    if let Ok(meta) = fs::metadata(&v_wal)
+        && meta.is_file()
+        && meta.len() > 0
+    {
+        ensure_hardlink(&v_wal, &a_wal)?;
+        let _ = touch_file_mtime_now(&a_wal);
+        wal_restored += 1;
     }
     Ok((db_restored, wal_restored))
 }
