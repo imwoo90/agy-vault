@@ -22,7 +22,8 @@ pub mod vault_engine;
 
 pub use daemon::{DaemonConfig, DaemonStats, run_daemon};
 pub use restore::{
-    RestoreReport, VaultStatus, compute_status, resolve_vault_uuid, restore_session,
+    RestoreReport, VaultStatus, compute_status, heal_evicted_sessions, resolve_vault_uuid,
+    restore_session,
 };
 pub use shim::{
     CliOptions, build_vault_config, extract_uuids_from_args, install_shim_script, parse_cli_args,

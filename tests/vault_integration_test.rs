@@ -181,15 +181,22 @@ fn test_sqlite_wal_clean_checkpoint_cleanup() -> TestResult {
 }
 
 #[test]
-fn test_inotify_daemon_auto_restore_on_annotation_access() -> TestResult {
+fn test_inotify_daemon_auto_restore_on_gc_delete_and_annotation_access() -> TestResult {
     let (root, cfg) = create_temp_sandbox("inotify_daemon")?;
     let uuid_evicted = "33333333-4444-5555-6666-777777777777";
+    let uuid_pruned_live = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
     populate_mock_session(&cfg, uuid_evicted, b"EVICTED-DB-CONTENT", false)?;
+    populate_mock_session(&cfg, uuid_pruned_live, b"PRUNED-LIVE-DB-CONTENT", false)?;
     sync_all(&cfg)?;
 
     let active_db = cfg
         .active_conversations_dir()
         .join(format!("{uuid_evicted}.db"));
+    let live_pruned_db = cfg
+        .active_conversations_dir()
+        .join(format!("{uuid_pruned_live}.db"));
+    let orig_mtime = fs::metadata(&live_pruned_db)?.mtime();
+
     fs::remove_file(&active_db)?;
     fs::remove_dir_all(cfg.active_brain_dir().join(uuid_evicted))?;
     assert!(!active_db.exists());
@@ -197,16 +204,15 @@ fn test_inotify_daemon_auto_restore_on_annotation_access() -> TestResult {
     let daemon_cfg = DaemonConfig {
         vault: cfg.clone(),
         poll_ms: 25,
-        max_ticks: Some(12),
+        max_ticks: Some(15),
     };
 
     let handle = thread::spawn(move || run_daemon(&daemon_cfg));
     thread::sleep(Duration::from_millis(60));
 
-    let ann_path = cfg
-        .active_annotations_dir()
-        .join(format!("{uuid_evicted}.pbtxt"));
-    let _content = fs::read_to_string(&ann_path)?;
+    // Simulate PruneAll unlinking uuid_pruned_live while daemon is watching!
+    fs::remove_file(&live_pruned_db)?;
+    fs::remove_dir_all(cfg.active_brain_dir().join(uuid_pruned_live))?;
 
     let uuid_live = "44444444-5555-6666-7777-888888888888";
     populate_mock_session(&cfg, uuid_live, b"LIVE-CREATED-DB", false)?;
@@ -214,9 +220,18 @@ fn test_inotify_daemon_auto_restore_on_annotation_access() -> TestResult {
     let stats = handle
         .join()
         .map_err(|_| "daemon thread panicked")??;
-    assert!(stats.auto_restores_triggered >= 1);
+    assert!(stats.auto_restores_triggered >= 2);
     assert!(active_db.is_file());
     assert_eq!(fs::read(&active_db)?, b"EVICTED-DB-CONTENT");
+    assert!(live_pruned_db.is_file());
+    assert_eq!(fs::read(&live_pruned_db)?, b"PRUNED-LIVE-DB-CONTENT");
+    assert_eq!(fs::metadata(&live_pruned_db)?.mtime(), orig_mtime);
+    assert!(
+        cfg.active_brain_dir()
+            .join(uuid_pruned_live)
+            .join(".system_generated/logs/transcript.jsonl")
+            .is_file()
+    );
     assert!(
         cfg.vault_conversations_dir()
             .join(format!("{uuid_live}.db"))

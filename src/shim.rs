@@ -9,7 +9,7 @@
 //! ## Search Tags
 //! #cli-shim, #arg-parser, #resume, #wrapper, #passthrough
 
-use crate::restore::{compute_status, resolve_vault_uuid, restore_session};
+use crate::restore::{compute_status, heal_evicted_sessions, resolve_vault_uuid, restore_session};
 use crate::vault_engine::{SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_all};
 use std::collections::BTreeSet;
 use std::fs;
@@ -264,6 +264,7 @@ pub fn run_shim_exec(
     real_agy_bin: &Path,
     passthrough_args: &[String],
 ) -> Result<i32, String> {
+    let _ = heal_evicted_sessions(config);
     let candidates = extract_uuids_from_args(passthrough_args);
     for candidate in &candidates {
         if let Ok(uuid) = resolve_vault_uuid(config, candidate) {
@@ -286,6 +287,7 @@ pub fn run_shim_exec(
         .map_err(|e| format!("failed to execute {}: {}", real_agy_bin.display(), e))?;
 
     let _ = sync_all(config);
+    let _ = heal_evicted_sessions(config);
     Ok(status.code().unwrap_or(1))
 }
 

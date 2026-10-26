@@ -13,10 +13,10 @@ use crate::vault_engine::{
     SyncReport, VaultConfig, ensure_hardlink, is_uuid_like, sync_directory_recursive,
 };
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 /// Quantitative report emitted by [`restore_session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,79 +68,59 @@ pub struct VaultStatus {
 
 /// Resolves an exact UUID or unambiguous UUID prefix inside `<vault_dir>`.
 pub fn resolve_vault_uuid(config: &VaultConfig, query: &str) -> Result<String, String> {
-    let trimmed = query
-        .trim()
-        .trim_end_matches(".db")
-        .trim_end_matches(".pbtxt");
-    if trimmed.is_empty() {
+    let q = query.trim().trim_end_matches(".db").trim_end_matches(".pbtxt");
+    if q.is_empty() {
         return Err("UUID query cannot be empty".to_string());
     }
-
     let mut matches = BTreeSet::new();
-    if config.vault_conversations_dir().is_dir() {
-        for entry in fs::read_dir(config.vault_conversations_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("db")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                && stem.starts_with(trimmed)
+    if let Ok(rd) = fs::read_dir(config.vault_conversations_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("db")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && stem.starts_with(q)
             {
                 matches.insert(stem.to_string());
             }
         }
     }
-    if config.vault_brain_dir().is_dir() {
-        for entry in fs::read_dir(config.vault_brain_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = entry.file_name().to_str()
-                && name.starts_with(trimmed)
+    if let Ok(rd) = fs::read_dir(config.vault_brain_dir()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+                && name.starts_with(q)
             {
                 matches.insert(name.to_string());
             }
         }
     }
-
     match matches.len() {
-        0 => Err(format!("session '{}' not found in vault", trimmed)),
-        1 => matches
-            .into_iter()
-            .next()
-            .ok_or_else(|| "unexpected empty match set".to_string()),
-        n => Err(format!(
-            "ambiguous UUID prefix '{}' matched {} sessions in vault",
-            trimmed, n
-        )),
+        0 => Err(format!("session '{q}' not found in vault")),
+        1 => matches.into_iter().next().ok_or_else(|| "empty match".to_string()),
+        n => Err(format!("ambiguous UUID prefix '{q}' matched {n} sessions")),
     }
 }
 
-/// Restores SQLite `.db`, `.db-wal`, and `.db-shm` files for `uuid` from vault to active.
+/// Restores SQLite `.db`, `.db-wal`, and `.db-shm` files for `uuid` from vault to active
+/// while preserving the original `ext4` inode modification timestamp (`mtime`).
 fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize), String> {
     let mut db_restored = false;
-    let vault_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
-    let active_db = config.active_conversations_dir().join(format!("{uuid}.db"));
-    if vault_db.is_file() {
-        ensure_hardlink(&vault_db, &active_db)?;
-        if let Ok(file) = File::options().write(true).open(&active_db) {
-            let _ = file.set_modified(SystemTime::now());
-        }
+    let v_db = config.vault_conversations_dir().join(format!("{uuid}.db"));
+    let a_db = config.active_conversations_dir().join(format!("{uuid}.db"));
+    if v_db.is_file() {
+        ensure_hardlink(&v_db, &a_db)?;
         db_restored = true;
     }
-
-    let mut wal_files_restored = 0usize;
+    let mut wal_restored = 0usize;
     for suffix in ["db-wal", "db-shm"] {
-        let vault_comp = config
-            .vault_conversations_dir()
-            .join(format!("{uuid}.{suffix}"));
-        let active_comp = config
-            .active_conversations_dir()
-            .join(format!("{uuid}.{suffix}"));
-        if vault_comp.is_file() {
-            ensure_hardlink(&vault_comp, &active_comp)?;
-            wal_files_restored += 1;
+        let v_c = config.vault_conversations_dir().join(format!("{uuid}.{suffix}"));
+        let a_c = config.active_conversations_dir().join(format!("{uuid}.{suffix}"));
+        if v_c.is_file() {
+            ensure_hardlink(&v_c, &a_c)?;
+            wal_restored += 1;
         }
     }
-    Ok((db_restored, wal_files_restored))
+    Ok((db_restored, wal_restored))
 }
 
 /// Restores a pruned conversation `<uuid>` (SQLite `.db*`, `brain/<uuid>/**`, and `.pbtxt`)
@@ -148,32 +128,29 @@ fn restore_sqlite_files(config: &VaultConfig, uuid: &str) -> Result<(bool, usize
 pub fn restore_session(config: &VaultConfig, uuid_query: &str) -> Result<RestoreReport, String> {
     let start = Instant::now();
     let uuid = resolve_vault_uuid(config, uuid_query)?;
-
-    fs::create_dir_all(config.active_conversations_dir()).map_err(|e| e.to_string())?;
-    fs::create_dir_all(config.active_brain_dir()).map_err(|e| e.to_string())?;
-    fs::create_dir_all(config.active_annotations_dir()).map_err(|e| e.to_string())?;
-
+    for dir in [
+        config.active_conversations_dir(),
+        config.active_brain_dir(),
+        config.active_annotations_dir(),
+    ] {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
     let (db_restored, wal_files_restored) = restore_sqlite_files(config, &uuid)?;
-
-    let vault_brain = config.vault_brain_dir().join(&uuid);
-    let active_brain = config.active_brain_dir().join(&uuid);
-    let mut dummy_report = SyncReport::default();
-    let brain_files_restored = if vault_brain.is_dir() {
-        sync_directory_recursive(&vault_brain, &active_brain, &mut dummy_report)?
+    let v_brain = config.vault_brain_dir().join(&uuid);
+    let a_brain = config.active_brain_dir().join(&uuid);
+    let mut dummy = SyncReport::default();
+    let brain_files_restored = if v_brain.is_dir() {
+        sync_directory_recursive(&v_brain, &a_brain, &mut dummy)?
     } else {
         0
     };
-
-    let vault_ann = config.vault_annotations_dir().join(format!("{uuid}.pbtxt"));
-    let active_ann = config
-        .active_annotations_dir()
-        .join(format!("{uuid}.pbtxt"));
+    let v_ann = config.vault_annotations_dir().join(format!("{uuid}.pbtxt"));
+    let a_ann = config.active_annotations_dir().join(format!("{uuid}.pbtxt"));
     let mut annotation_restored = false;
-    if vault_ann.is_file() && !active_ann.is_file() {
-        ensure_hardlink(&vault_ann, &active_ann)?;
+    if v_ann.is_file() && !a_ann.is_file() {
+        ensure_hardlink(&v_ann, &a_ann)?;
         annotation_restored = true;
     }
-
     Ok(RestoreReport {
         uuid,
         db_restored,
@@ -185,83 +162,99 @@ pub fn restore_session(config: &VaultConfig, uuid_query: &str) -> Result<Restore
 }
 
 /// Counts active and vaulted conversation `.db` files and verifies shared `ext4` inodes.
-fn count_conversation_dbs(config: &VaultConfig, status: &mut VaultStatus) -> Result<(), String> {
-    if config.active_conversations_dir().is_dir() {
-        for entry in fs::read_dir(config.active_conversations_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.path().extension().and_then(|s| s.to_str()) == Some("db") {
-                status.active_conversations += 1;
+fn count_conversation_dbs(config: &VaultConfig, st: &mut VaultStatus) {
+    if let Ok(rd) = fs::read_dir(config.active_conversations_dir()) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|s| s.to_str()) == Some("db") {
+                st.active_conversations += 1;
             }
         }
     }
-
-    if config.vault_conversations_dir().is_dir() {
-        for entry in fs::read_dir(config.vault_conversations_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let vault_path = entry.path();
-            if vault_path.extension().and_then(|s| s.to_str()) == Some("db") {
-                status.vault_conversations += 1;
-                if let Some(name) = vault_path.file_name() {
-                    let active_path = config.active_conversations_dir().join(name);
-                    if let (Ok(v_meta), Ok(a_meta)) =
-                        (fs::metadata(&vault_path), fs::metadata(&active_path))
-                    {
-                        if v_meta.dev() == a_meta.dev() && v_meta.ino() == a_meta.ino() {
-                            status.shared_inode_conversations += 1;
+    if let Ok(rd) = fs::read_dir(config.vault_conversations_dir()) {
+        for e in rd.flatten() {
+            let vp = e.path();
+            if vp.extension().and_then(|s| s.to_str()) == Some("db") {
+                st.vault_conversations += 1;
+                if let Some(name) = vp.file_name() {
+                    let ap = config.active_conversations_dir().join(name);
+                    if let (Ok(vm), Ok(am)) = (fs::metadata(&vp), fs::metadata(&ap)) {
+                        if vm.dev() == am.dev() && vm.ino() == am.ino() {
+                            st.shared_inode_conversations += 1;
                         }
                     } else {
-                        status.vault_only_conversations += 1;
+                        st.vault_only_conversations += 1;
                     }
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Computes comprehensive vault status, inode sharing counts, and storage overhead metrics.
 pub fn compute_status(config: &VaultConfig) -> Result<VaultStatus, String> {
-    let mut status = VaultStatus::default();
-    count_conversation_dbs(config, &mut status)?;
-
-    if config.active_brain_dir().is_dir() {
-        for entry in fs::read_dir(config.active_brain_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = entry.file_name().to_str()
-                && is_uuid_like(name)
+    let mut st = VaultStatus::default();
+    count_conversation_dbs(config, &mut st);
+    if let Ok(rd) = fs::read_dir(config.active_brain_dir()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.file_name().to_str().is_some_and(is_uuid_like)
             {
-                status.active_brain_dirs += 1;
+                st.active_brain_dirs += 1;
             }
         }
     }
-
-    if config.vault_brain_dir().is_dir() {
-        for entry in fs::read_dir(config.vault_brain_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = entry.file_name().to_str()
+    if let Ok(rd) = fs::read_dir(config.vault_brain_dir()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
                 && is_uuid_like(name)
             {
-                status.vault_brain_dirs += 1;
+                st.vault_brain_dirs += 1;
                 if !config.active_brain_dir().join(name).is_dir() {
-                    status.vault_only_brain_dirs += 1;
+                    st.vault_only_brain_dirs += 1;
                 }
             }
         }
     }
-
-    if config.vault_annotations_dir().is_dir() {
-        for entry in fs::read_dir(config.vault_annotations_dir()).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.path().extension().and_then(|s| s.to_str()) == Some("pbtxt") {
-                status.vault_annotations += 1;
+    if let Ok(rd) = fs::read_dir(config.vault_annotations_dir()) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|s| s.to_str()) == Some("pbtxt") {
+                st.vault_annotations += 1;
             }
         }
     }
+    accumulate_vault_file_metrics(&config.vault_dir, &mut st)?;
+    Ok(st)
+}
 
-    accumulate_vault_file_metrics(&config.vault_dir, &mut status)?;
-    Ok(status)
+/// Automatically re-hardlinks any session present in `<vault_dir>` whose `.db` or `brain/<uuid>`
+/// directory was unlinked from `<agy_dir>` by Antigravity's 500-conversation `PruneAll` GC.
+pub fn heal_evicted_sessions(config: &VaultConfig) -> Result<usize, String> {
+    let mut evicted = BTreeSet::new();
+    if let Ok(rd) = fs::read_dir(config.vault_conversations_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("db")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && is_uuid_like(stem)
+                && !config.active_conversations_dir().join(format!("{stem}.db")).is_file()
+            {
+                evicted.insert(stem.to_string());
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(config.vault_brain_dir()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+                && is_uuid_like(name)
+                && !config.active_brain_dir().join(name).is_dir()
+            {
+                evicted.insert(name.to_string());
+            }
+        }
+    }
+    Ok(evicted.into_iter().filter(|u| restore_session(config, u).is_ok()).count())
 }
 
 /// Walks `<vault_dir>` recursively to tally `nlink >= 2` (shared) vs `nlink == 1` (vault-only) files.
