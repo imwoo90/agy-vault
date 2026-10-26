@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Auto Tag and Build Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -n 1 | awk -F '"' '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if Tag Exists
+        id: check_tag
+        run: |
+          TAG_NAME="v${{ steps.get_version.outputs.version }}"
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $TAG_NAME already exists. Skipping release creation."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $TAG_NAME does not exist. Proceeding with release."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        if: steps.check_tag.outputs.exists == 'false'
+        run: cargo build --release
+
+      - name: Prepare distribution files
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          cp target/release/agy-vault target/release/agy-vault-linux-amd64
+          mkdir -p dist/agy-vault-linux-amd64
+          cp target/release/agy-vault dist/agy-vault-linux-amd64/
+          tar -czf dist/agy-vault-linux-amd64.tar.gz -C dist agy-vault-linux-amd64
+
+      - name: Create GitHub Release and Upload Assets
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: Release v${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            target/release/agy-vault-linux-amd64
+            dist/agy-vault-linux-amd64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
